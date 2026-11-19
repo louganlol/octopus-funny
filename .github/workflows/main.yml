@@ -1,0 +1,93 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      crd_code:
+        description: "Código de remotedesktop.google.com/headless (el que va después de --code=, empieza con 4/)"
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          Restart-Service -Name TermService -Force
+
+      - name: Set runneradmin password
+        env:
+          RUNNERADMIN_PASSWORD: ${{ secrets.RUNNERADMIN_PASSWORD }}
+        run: |
+          $securePass = ConvertTo-SecureString $env:RUNNERADMIN_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $securePass
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+      - name: Install dependencies
+        run: |
+          Invoke-WebRequest "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile "$env:TEMP\crd.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\crd.msi`"", "/qn", "/norestart" -Wait
+          Remove-Item "$env:TEMP\crd.msi" -Force
+
+      - name: Start host
+        env:
+          CRD_CODE: ${{ github.event.inputs.crd_code }}
+          CRD_PIN: ${{ secrets.CRD_PIN }}
+        run: |
+          $raw = "$env:CRD_CODE"
+
+          if ($raw -match '--code="?([^"\s]+)') { $code = $Matches[1] }
+          elseif ($raw -match '4/[A-Za-z0-9_\-\.]+') { $code = $Matches[0] }
+          else { $code = $raw.Trim().Trim('"') }
+
+          $pin = "$env:CRD_PIN".Trim()
+
+          Write-Host "Largo del código: $($code.Length)"
+          Write-Host "Empieza con 4/: $($code.StartsWith('4/'))"
+          Write-Host "Largo del PIN: $($pin.Length)"
+
+          if (-not $code.StartsWith('4/')) { Write-Error "El código debe empezar con 4/. Pega solo lo que va después de --code="; exit 1 }
+          if ($pin -notmatch '^\d{6,}$') { Write-Error "CRD_PIN no existe como secret o no son 6+ dígitos"; exit 1 }
+
+          $crd = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          $crdArgs = @(
+            "--code=$code",
+            "--redirect-url=https://remotedesktop.google.com/_/oauthredirect",
+            "--display-name=$env:COMPUTERNAME",
+            "--pin=$pin"
+          )
+          & $crd @crdArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "Falló (exit code $LASTEXITCODE). Genera un código nuevo y lanza una ejecución nueva."; exit 1 }
+          Write-Host "Host iniciado"
+
+      - name: Run setup script
+        run: |
+          $startupPath = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+          Write-Host "Script copiado a $downloadPath"
+
+          cmd /c $downloadPath
+          Write-Host "Script ejecutado"
+
+      - name: Keep alive
+        run: |
+          while ($true) {
+              $svc = Get-Service -Name chromoting -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -ne 'Running') {
+                  Write-Host "[$(Get-Date)] chromoting caído, reiniciando..."
+                  Start-Service -Name chromoting
+              }
+              Write-Host "[$(Get-Date)] Active"
+              Start-Sleep -Seconds 60
+          }
